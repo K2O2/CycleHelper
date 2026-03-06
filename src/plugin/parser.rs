@@ -9,11 +9,10 @@ lazy_static::lazy_static! {
     static ref WEICHUANG_PATTERN1: Regex = Regex::new(r"^SN(\d+)_Ch(\d+)_").unwrap();
     static ref WEICHUANG_PATTERN2: Regex = Regex::new(r"^Ch(\d+)_SN(\d+)_").unwrap();
 
-    static ref NEBULA_PATTERN: Regex = Regex::new(r"^([^_]+)_(\d+)_").unwrap();
+    static ref NEBULA_PATTERN: Regex = Regex::new(r"^(\d+)_(\d+)_").unwrap();
 }
 
 #[derive(Debug, PartialEq)]
-#[derive(Clone)]
 pub(crate) enum Sources {
     Shenghong,
     Weichuang,
@@ -51,63 +50,54 @@ pub(crate) fn form_name(filename: &str) -> Result<(Sources, String, String)> {
     )))
 }
 
+// 测试模块
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use super::*;
+
     #[test]
-    fn test_form_init() {
-        use std::fs;
-        use std::time::Instant;
+    fn test_parse_weichuang() {
+        // 测试SN在前，Ch在后的格式
+        let result = form_name("SN101_Ch03_满充软包50Ah_CN3_20250926095254_CY1.xlsx").unwrap();
+        println!("{:?}", result);
 
-        let dir_path = PathBuf::from(r"E:\share\cycles\20260202\循环数据采集20260202\D2-25");
+        // 测试Ch在前，SN在后的格式
+        let result = form_name("Ch05_SN202_测试文件.xlsx").unwrap();
+        println!("{:?}", result);
+    }
 
-        println!("开始遍历目录: {:?}", dir_path);
+    #[test]
+    fn test_parse_shenghong() {
+        // 测试SN在前，Ch在后的格式
+        let result = form_name("UN153_CN01_20251022153541_CY165.xlsx").unwrap();
+        println!("{:?}", result);
 
-        let entries: Vec<_> = fs::read_dir(&dir_path)
-            .expect("无法读取目录")
-            .filter_map(Result::ok)
-            .collect();
+        // 测试Ch在前，SN在后的格式
+        let result = form_name("CN02_UN255_测试文件.xlsx").unwrap();
+        println!("{:?}", result);
+    }
 
-        let mut success_count = 0;
-        let mut fail_count = 0;
-        let start_time = Instant::now();
+    #[test]
+    fn test_parse_nebula() {
+        let result = form_name("100_2_202509043814 45℃循环.xlsx").unwrap();
+        println!("{:?}", result);
 
-        for (i, entry) in entries.iter().enumerate() {
-            let path = entry.path();
+        // 测试多位数
+        let result = form_name("1000_25_测试文件.xlsx").unwrap();
+        println!("{:?}", result);
+    }
 
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "xlsx") {
-                let file_name = path.file_name().unwrap().to_string_lossy();
-                println!(
-                    "\n[{}/{}] 处理: {}",
-                    i + 1,
-                    entries.len(),
-                    file_name
-                );
+    #[test]
+    fn test_parse_errors() {
+        // 测试无效格式
+        assert!(form_name("invalid_file.txt").is_err());
+        assert!(form_name("SN101_XX03_测试.xlsx").is_err()); // XX不是Ch
+        assert!(form_name("UN153_XX01_测试.xlsx").is_err()); // XX不是CN
+        assert!(form_name("100_测试.xlsx").is_err()); // 缺少下划线分隔
+        assert!(form_name("100_2A_测试.xlsx").is_err()); // 通道号包含非数字
 
-                match form_name(&file_name) {
-                    Ok(info) => {
-                        println!("  ✓ 成功: {:?}", info);
-                        success_count += 1;
-
-                        //test for read cycle data
-                        // let result = info.get_cycle_last();
-                        // let result = info.get_run_time();
-                        // println!("读取结果: {:?}", result);
-                    }
-                    Err(e) => {
-                        println!("  ✗ 错误: {}", e);
-                        fail_count += 1;
-                    }
-                }
-            }
-        }
-
-        let duration = start_time.elapsed();
-        println!("\n=== 处理完成 ===");
-        println!("总文件数: {}", entries.len());
-        println!("成功: {} 个", success_count);
-        println!("失败: {} 个", fail_count);
-        println!("耗时: {:.2?}", duration);
+        //test
+        let result = form_name("UN153_XX01_测试.xlsx");
+        println!("{:?}", result);
     }
 }

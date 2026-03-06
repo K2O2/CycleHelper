@@ -1,2 +1,2 @@
 # CycleHelper
-automatic parser for battery test data(include ShengHong,WeiChuang,Nebula)
+automatic parser for battery test data(ShengHong,WeiChuang,Nebula)

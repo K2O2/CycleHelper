@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Error, Result};
+use anyhow::{Error, Result};
 use calamine::{Reader, Xlsx, open_workbook};
 use regex::Regex;
 use std::path::PathBuf;
@@ -9,95 +9,80 @@ const SHENGHONG_DATA: &str = "循环数据表";
 const NEBULA_DATA: &str = "循环层";
 const WEICHUANG_DATA:&str = "循环数据表";
 
-const WEICHUANG_INFO:&str = "数据表";
-
 pub(crate) fn cycle_first(file_path: &PathBuf, data_type: &Sources) -> Result<(u32, f32)> {
-    let mut reader: Xlsx<_> = open_workbook(file_path)
-        .with_context(|| format!("无法打开文件: {}", file_path.display()))?;
+    let mut reader: Xlsx<_> = open_workbook(file_path).expect("Cannot open file");
 
-    match data_type {
+    return match data_type {
         Sources::Shenghong => {
             let sheet = reader
                 .worksheet_range(SHENGHONG_DATA)
-                .with_context(|| "无法找到工作表范围，请检查是否为盛洪BTS生成")?;
+                .expect("Cannot find sheet range");
 
             let max_row_count = sheet.rows().len();
 
             if max_row_count < 4 {
-                return Err(anyhow!("循环次数过少数据失真，取消获取过程"));
+                return Err(Error::msg("循环次数过少数据失真，取消获取过程"));
             }
 
-            let cycle_count_cell = sheet.get((3, 0))
-                .ok_or_else(|| anyhow!("读取失败：错误的数据格式，第4行第1列为空，请检查是否为盛洪BTS生成"))?;
-            let cycle_count: u32 = cycle_count_cell
-                .to_string()
-                .parse()
-                .with_context(|| format!("解析循环次数失败: {}", cycle_count_cell))?;
+            let cycle_count: u32 = sheet
+                .get((3, 0))
+                .expect("读取失败：错误的数据格式,请检查是否为盛洪BTS生成")
+                .to_string().parse()?;
 
-            let output_capacity_cell = sheet.get((3, 2))
-                .ok_or_else(|| anyhow!("读取失败：错误的数据格式，第4行第3列为空，请检查是否为盛洪BTS生成"))?;
-            let output_capacity: f32 = output_capacity_cell
-                .to_string()
-                .parse()
-                .with_context(|| format!("解析输出容量失败: {}", output_capacity_cell))?;
+            let output_capacity: f32 = sheet
+                .get((3, 2))
+                .expect("读取失败：错误的数据格式,请检查是否为盛洪BTS生成")
+                .to_string().parse()?;
 
             Ok((cycle_count, output_capacity))
         }
         Sources::Nebula => {
             let sheet = reader
                 .worksheet_range(NEBULA_DATA)
-                .with_context(|| "无法找到工作表范围，请检查是否为星云生成")?;
+                .expect("Cannot find sheet range");
 
-            let max_row_count = sheet.rows().len();
+            let mut max_row_count = sheet.rows().len();
 
             if max_row_count < 4 {
-                return Err(anyhow!("循环次数过少数据失真，取消获取过程"));
+                return Err(Error::msg("循环次数过少数据失真，取消获取过程"));
             }
 
-            let cycle_count_cell = sheet.get((3, 0))
-                .ok_or_else(|| anyhow!("读取失败：错误的数据格式，第4行第1列为空，请检查是否为星云生成"))?;
-            let cycle_count: u32 = cycle_count_cell
-                .to_string()
-                .parse()
-                .with_context(|| format!("解析循环次数失败: {}", cycle_count_cell))?;
+            let cycle_count: u32 = sheet
+                .get((3, 0))
+                .expect("读取失败：错误的数据格式,请检查是否为星云生成")
+                .to_string().parse()?;
 
-            let output_capacity_cell = sheet.get((3, 5))
-                .ok_or_else(|| anyhow!("读取失败：错误的数据格式，第4行第6列为空，请检查是否为星云生成"))?;
-            let output_capacity: f32 = output_capacity_cell
-                .to_string()
-                .parse()
-                .with_context(|| format!("解析输出容量失败: {}", output_capacity_cell))?;
+            let output_capacity: f32 = sheet
+                .get((3, 5))
+                .expect("读取失败：错误的数据格式,请检查是否为星云生成")
+                .to_string().parse()?;
 
-            Ok((cycle_count, output_capacity.abs()))
-        }
+            Ok((cycle_count, output_capacity.abs()))//nebula is -1
+        },
         Sources::Weichuang => {
             let sheet = reader
                 .worksheet_range(WEICHUANG_DATA)
-                .with_context(|| "无法找到工作表范围，请检查是否为伟创生成")?;
+                .expect("Cannot find sheet range");
 
-            let max_row_count = sheet.rows().len();
+            let mut max_row_count = sheet.rows().len();
 
             if max_row_count < 4 {
-                return Err(anyhow!("循环次数过少数据失真，取消获取过程"));
+                return Err(Error::msg("循环次数过少数据失真，取消获取过程"));
             }
 
-            let cycle_count_cell = sheet.get((3, 0))
-                .ok_or_else(|| anyhow!("读取失败：错误的数据格式，第4行第1列为空，请检查是否为伟创生成"))?;
-            let cycle_count: u32 = cycle_count_cell
-                .to_string()
-                .parse()
-                .with_context(|| format!("解析循环次数失败: {}", cycle_count_cell))?;
+            let cycle_count: u32 = sheet
+                .get((3, 0))
+                .expect("读取失败：错误的数据格式,请检查是否为伟创生成")
+                .to_string().parse()?;
 
-            let output_capacity_cell = sheet.get((3, 2))
-                .ok_or_else(|| anyhow!("读取失败：错误的数据格式，第4行第3列为空，请检查是否为伟创生成"))?;
-            let output_capacity: f32 = output_capacity_cell
-                .to_string()
-                .parse()
-                .with_context(|| format!("解析输出容量失败: {}", output_capacity_cell))?;
+            let output_capacity: f32 = sheet
+                .get((3, 5))
+                .expect("读取失败：错误的数据格式,请检查是否为伟创生成")
+                .to_string().parse()?;
 
             Ok((cycle_count, output_capacity))
         }
-    }
+    };
 }
 
 pub(crate) fn cycle_last(file_path: &PathBuf, data_type: &Sources) -> Result<(u32, f32)> {
@@ -142,13 +127,6 @@ pub(crate) fn cycle_last(file_path: &PathBuf, data_type: &Sources) -> Result<(u3
                 return Err(Error::msg("循环次数过少数据失真，取消获取过程"));
             }
 
-            // let cycle_count = sheet
-            //     .get((max_row_count, 1))
-            //     .expect("读取失败：错误的数据格式,请检查是否为星云生成")
-            //     .to_string();
-            //
-            // println!("output:{}",cycle_count);
-
             let cycle_count: u32 = sheet
                 .get((max_row_count, 0))
                 .expect("读取失败：错误的数据格式,请检查是否为星云生成")
@@ -180,34 +158,13 @@ pub(crate) fn cycle_last(file_path: &PathBuf, data_type: &Sources) -> Result<(u3
                 .to_string().parse()?;
 
             let output_capacity: f32 = sheet
-                .get((max_row_count, 2))
+                .get((max_row_count, 5))
                 .expect("读取失败：错误的数据格式,请检查是否为伟创生成")
                 .to_string().parse()?;
 
             Ok((cycle_count, output_capacity))
         }
     };
-}
-
-pub(crate) fn get_run_time(file_path: &PathBuf, data_type: &Sources) -> Result<String> {
-    let mut reader: Xlsx<_> = open_workbook(file_path).expect("Cannot open file");
-    return match data_type {
-        Sources::Shenghong => {
-            let sheet = reader.worksheet_range(WEICHUANG_INFO).expect("Cannot find sheet range");
-
-            let time:f32 = sheet.get((6, 1)).expect("读取失败：错误的数据格式,请检查是否为盛洪BTS生成").to_string().parse()?;
-
-            let time = time * 24.0;
-
-            //cut
-            let time = time.floor().to_string();
-
-            Ok(time)
-        }
-        _ => {
-            Ok(String::new())
-        }
-    }
 }
 
 // 预编译正则表达式
@@ -219,7 +176,7 @@ const SHENGHONG_KEY: &str = "数据表";
 const NEBULA_KEY: &str = "测试信息";
 const WEICHUANG_KEY: &str = "通道信息表";
 
-pub(crate) fn form_info(file_path: &PathBuf) -> Result<(Sources, String, u32)> {
+pub(crate) fn form_info(file_path: &PathBuf) -> Result<(Sources, String, String)> {
     let mut reader: Xlsx<_> = open_workbook(file_path).expect("Cannot open file");
 
     let sheet_names = reader.sheet_names();
@@ -230,11 +187,11 @@ pub(crate) fn form_info(file_path: &PathBuf) -> Result<(Sources, String, u32)> {
             let unit = sheet
                 .get((2, 1))
                 .expect("读取失败：错误的元数据格式")
-                .to_string().parse()?;
+                .to_string();
             let channel = sheet
                 .get((3, 1))
                 .expect("读取失败：错误的元数据格式")
-                .to_string().parse()?;
+                .to_string();
 
             println!("查询成功，通道号：{}-{}", unit, channel);
             return Ok((Sources::Shenghong, unit, channel));
@@ -247,13 +204,13 @@ pub(crate) fn form_info(file_path: &PathBuf) -> Result<(Sources, String, u32)> {
             let channel = sheet
                 .get((7, 2))
                 .expect("读取失败：错误的元数据格式")
-                .to_string().parse()?;
+                .to_string();
 
             let unit = unit
                 .split('.')
                 .last()
                 .map(|s| s.to_string())
-                .unwrap_or(unit).parse()?; //for ip spilt
+                .unwrap_or(unit); //for ip spilt
 
             println!("查询成功，通道号：{}-{}", unit, channel);
 
@@ -271,8 +228,6 @@ pub(crate) fn form_info(file_path: &PathBuf) -> Result<(Sources, String, u32)> {
 
             return match result {
                 Some((unit, channel)) => {
-                    let unit = unit.parse()?;
-                    let channel = channel.parse()?;
                     println!("查询成功，通道号：{}-{}", unit, channel);
 
                     Ok((Sources::Weichuang, unit, channel))
@@ -286,4 +241,82 @@ pub(crate) fn form_info(file_path: &PathBuf) -> Result<(Sources, String, u32)> {
         "Unable to find sheet in workbook: {}",
         file_path.display()
     )));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use calamine::{Data, Reader, Xlsx, open_workbook};
+    #[test]
+    fn test_form_info() {
+        use std::fs;
+        use std::time::Instant;
+
+        let dir_path = PathBuf::from(r"C:\Users\admin\Desktop\循环导出测试\样本");
+
+        println!("开始遍历目录: {:?}", dir_path);
+
+        let entries: Vec<_> = fs::read_dir(&dir_path)
+            .expect("无法读取目录")
+            .filter_map(Result::ok)
+            .collect();
+
+        let mut success_count = 0;
+        let mut fail_count = 0;
+        let start_time = Instant::now();
+
+        for (i, entry) in entries.iter().enumerate() {
+            let path = entry.path();
+
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "xlsx") {
+                println!(
+                    "\n[{}/{}] 处理: {}",
+                    i + 1,
+                    entries.len(),
+                    path.file_name().unwrap().to_string_lossy()
+                );
+
+                match form_info(&path) {
+                    Ok(info) => {
+                        println!("  ✓ 成功: {:?}", info);
+                        success_count += 1;
+                    }
+                    Err(e) => {
+                        println!("  ✗ 错误: {}", e);
+                        fail_count += 1;
+                    }
+                }
+            }
+        }
+
+        let duration = start_time.elapsed();
+        println!("\n=== 处理完成 ===");
+        println!("总文件数: {}", entries.len());
+        println!("成功: {} 个", success_count);
+        println!("失败: {} 个", fail_count);
+        println!("耗时: {:.2?}", duration);
+    }
+    #[test]
+    fn test_form_info_2() {
+        let path = PathBuf::from(r"C:\Users\admin\Desktop\循环导出测试\5\1.xlsx");
+        // opens a new workbook
+        let mut workbook: Xlsx<_> = open_workbook(path).expect("Cannot open file");
+
+        // Read whole worksheet data and provide some statistics
+        if let Ok(range) = workbook.worksheet_range(NEBULA_KEY) {
+            let total_cells = range.get_size().0 * range.get_size().1;
+            let non_empty_cells: usize = range.used_cells().count();
+            println!(
+                "Found {total_cells} cells in 'Sheet1', including {non_empty_cells} non empty cells"
+            );
+            // alternatively, we can manually filter rows
+            assert_eq!(
+                non_empty_cells,
+                range
+                    .rows()
+                    .flat_map(|r| r.iter().filter(|&c| c != &Data::Empty))
+                    .count()
+            );
+        }
+    }
 }

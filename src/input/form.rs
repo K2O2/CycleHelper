@@ -4,14 +4,13 @@ use std::path::PathBuf;
 use crate::plugin::parser;
 use crate::plugin::parser::Sources;
 use crate::plugin::reader;
-use crate::plugin::reader::get_run_time;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DataForm {
     path: PathBuf,
     source: Sources,
     unit: String,
-    channel: u32,
+    channel: String,
 }
 
 impl DataForm {
@@ -28,12 +27,12 @@ impl DataForm {
             return Ok(DataForm {
                 path: path.clone(),
                 source: parser.0,
-                unit: parser.1.parse()?,
-                channel: parser.2.parse()?,
+                unit: parser.1,
+                channel: parser.2,
             });
         }
 
-        println!("文件名分析错误：{} 尝试进入文件获取信息", filename);
+        println!("文件名分析错误：{:?} 尝试进入文件获取信息", parser);
 
         let reader = reader::form_info(path);
 
@@ -59,21 +58,6 @@ impl DataForm {
 
         return Ok((cycle_count, cycle_data));
     }
-    pub fn get_form_path(&self) -> PathBuf {
-        self.path.clone()
-    }
-    pub fn channel_eq(&self, other: &str) -> bool {
-        let channel = format!("{}-{}", self.unit, self.channel);
-        return if channel == other { true } else { false };
-    }
-    pub fn get_channel(&self) -> String {
-        let channel = format!("{}-{}", self.unit, self.channel);
-        return channel;
-    }
-    pub fn get_run_time(&self) -> Result<String> {
-        let time = get_run_time(&self.path, &self.source);
-        return time;
-    }
 }
 
 #[cfg(test)]
@@ -84,7 +68,7 @@ mod tests {
         use std::fs;
         use std::time::Instant;
 
-        let dir_path = PathBuf::from(r"E:\share\cycles\20260202\循环数据采集20260202\D2-25");
+        let dir_path = PathBuf::from(r"C:\Users\admin\Desktop\循环导出测试\样本");
 
         println!("开始遍历目录: {:?}", dir_path);
 
@@ -115,7 +99,6 @@ mod tests {
 
                         //test for read cycle data
                         let result = info.get_cycle_last();
-                        // let result = info.get_run_time();
                         println!("读取结果: {:?}", result);
                     }
                     Err(e) => {

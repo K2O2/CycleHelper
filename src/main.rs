@@ -1,12 +1,21 @@
-use anyhow::{Context, Error, Result};
-use dialoguer::Select;
-use edit_xlsx;
-use edit_xlsx::{Read, WorkSheet, Workbook, Write};
+use anyhow::{bail, Context, Error, Result};
+use calamine::{open_workbook, Data, Reader, Xlsx};
+use chrono::Local;
+use colored::Colorize;
+use dialoguer::{Confirm, Input, Select};
 use regex::Regex;
 use rfd::FileDialog;
+use rust_xlsxwriter::{Format, FormatAlign, FormatBorder, Workbook, XlsxError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::{fmt, fs};
+use std::str::FromStr;
+use tokio::sync::RwLock;
+
+use cycle_helper::input::form::DataForm;
+
+const CYCLE_SHEET: &str = "循环中";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,16 +25,32 @@ async fn main() -> Result<()> {
 }
 
 async fn interactive_mode() -> Result<()> {
-    println!("🔋 电芯数据管理工具");
+    println!("🔋 电芯数据管理工具 Alpha-0.2.3 NO.264323");
     println!("===================");
+
+    let main_data = Arc::from(RwLock::from(Vec::new()));
 
     loop {
         let options = vec![
-            "1. 执行完整流程",
-            "2. 创建输出目录",
-            "3. 写入循环数据并复制文件",
-            "4. 显示帮助",
-            "5. 退出",
+            "1. 导入数据表",
+            "2. 创建数据采集目录",
+            "3. 读取并更新循环数据",
+            "4. 输出数据表",
+            "5. 整理数据文件到指定目录",
+            "6. 显示循环数据",
+            "7. 退出",
+            "8. 读取并更新循环数据V2(Beta)",
+            "",
+            "0.2.3更新日志",
+            "-----------------------------------",
+            "1.更新了星云的数据文件匹配",
+            "2.完成的星云导出的Beta测试，目前已经可以读取相关数据文件",
+            "",
+            "0.2.2更新日志",
+            "-----------------------------------",
+            "1.全新重构的更新函数进入Beta测试",
+            "2.增加了圈数手动处理选项，可根据需要自行选择",
+            "如遇其他问题，请联系hyperflex@qq.com"
         ];
 
         let selection = Select::new()
@@ -35,14 +60,17 @@ async fn interactive_mode() -> Result<()> {
             .interact()?;
 
         match selection {
-            0 => run_complete_interactive().await?,
-            1 => create_output_dir_interactive().await?,
-            2 => write_cycle_interactive().await?,
-            3 => print_manual(),
-            4 => {
-                println!("再见！");
+            0 => import_data_from_list(main_data.clone()).await?,
+            1 => create_import_dir(main_data.clone()).await?,
+            2 => read_update_cycle(main_data.clone()).await?,
+            3 => write_to_xlsx(main_data.clone()).await?,
+            4 => form_manage(main_data.clone()).await?,
+            5 => print_data(main_data.clone()).await,
+            6 => {
+                println!("再见！NO.264323");
                 break;
             }
+            7 => read_update_cycle_v2(main_data.clone()).await?,
             _ => println!("无效选择"),
         }
 
@@ -51,587 +79,583 @@ async fn interactive_mode() -> Result<()> {
 
     Ok(())
 }
-async fn create_output_dir_interactive() -> Result<()> {
-    println!("📁 选择数据表文件");
 
-    let path = if let Some(file) = file_dialog_select("选择数据表", &["xlsx"], true) {
+async fn form_manage(data: Arc<RwLock<Vec<ChannelInfo>>>) -> Result<()> {
+    let channel_list = data.read().await;
+
+    let mut manage_list = Vec::new();
+
+    for channel in channel_list.iter() {
+        let form_path = channel.form_path.clone();
+        if form_path.is_some() {
+            //organize file name
+            let new_filename = format!(
+                "{} {}-{}.xlsx",
+                channel.sample_id, channel.device, channel.channel
+            );
+            let new_path = format!(
+                "{}//{} {}//{}//{}",
+                channel.sample_model,
+                channel.project_code,
+                channel.sample_person.clone().unwrap_or(String::new()),
+                channel.test_temperature,
+                new_filename
+            );
+            manage_list.push((form_path.unwrap(), new_path));
+        }
+    }
+
+    if manage_list.len() == 0 {
+        println!("❌ 列表为空,停止整理,请确认已完成数据采集");
+        return Ok(());
+    }
+
+    println!("📁 数据准备完成,选择数据整理目标位置");
+    let dialog = FileDialog::new()
+        .set_title("选择数据整理到")
+        .set_directory("/");
+
+    let current_date = Local::now().format("%Y%m%d").to_string();
+    let default_folder_name = format!("{}循环数据整理", current_date);
+
+    let dialog = dialog.pick_folder();
+
+    let manage_dir = if let Some(folder) = dialog {
+        folder.join(&default_folder_name)
+    } else {
+        println!("❌ 未选择目录");
+        return Ok(());
+    };
+
+    for (form_path, new_path) in manage_list {
+        let new_path = manage_dir.join(&new_path);
+        // println!("{:?},{:?}",form_path, new_path);
+        let _result = copy_file_with_checks(&form_path, &new_path);
+        // println!("{:?}",_result);
+    }
+
+    Ok(())
+}
+
+async fn write_to_xlsx(data: Arc<RwLock<Vec<ChannelInfo>>>) -> Result<()> {
+    let channel_list = data.read().await;
+
+    println!("📁 选择数据表输出目录");
+    let current_date = Local::now().format("%Y%m%d").to_string();
+    let default_list_name = format!("{}循环数据表", current_date);
+    let dialog = FileDialog::new()
+        .set_title("选择数据表文件")
+        .set_directory("/")
+        .add_filter("Excel表格", &["xlsx"])
+        .set_file_name(default_list_name)
+        .save_file();
+
+    let path = if let Some(file) = dialog {
         file
     } else {
         println!("❌ 未选择文件");
         return Ok(());
     };
 
-    let cycle_manager = ChannelManager::load_manage_list(path).await?;
-    println!("✅ 成功加载管理列表");
+    let _result = write_channel_info_to_xlsx(&channel_list, &path);
 
-    println!("📁 选择数据导出目录生成位置");
+    Ok(())
+}
 
-    let path = if let Some(dir) = file_dialog_select("选择数据导出目录生成位置", &[], false)
-    {
-        dir
+async fn read_update_cycle(data: Arc<RwLock<Vec<ChannelInfo>>>) -> Result<()> {
+    let data_read = data.read().await;
+
+    if data_read.len() == 0 {
+        println!("❌ 列表为空,停止导出");
+        return Ok(());
+    }
+
+    let mut import_list = HashMap::new();
+
+    for channel_info in data_read.iter() {
+        let channel_active = channel_info.get_active();
+        if channel_active.is_some() {
+            let device = channel_info.get_device();
+            import_list
+                .entry(device.to_string())
+                .or_insert_with(Vec::new)
+                .push(channel_active.unwrap());
+        } else {
+            continue;
+        }
+    }
+
+    // println!("{:?}",import_list);
+
+    drop(data_read);
+
+    println!("📁 数据准备完成,选择数据采集目录");
+    let dialog = FileDialog::new()
+        .set_title("选择数据采集目录")
+        .set_directory("/");
+
+    let dialog = dialog.pick_folder();
+
+    let data_dir = if let Some(folder) = dialog {
+        folder
     } else {
         println!("❌ 未选择目录");
         return Ok(());
     };
 
-    let _result = cycle_manager.crate_output_dir(path).await?;
-    println!("✅ 成功创建输出目录");
-    Ok(())
-}
+    let device_list: Vec<String> = import_list.keys().cloned().collect();
 
-async fn write_cycle_interactive() -> Result<()> {
-    println!("📁 选择数据表文件");
+    let mut data_dir_list = HashMap::new();
 
-    let list_path = file_dialog_select("选择数据表", &["xlsx"], true).unwrap();
-    let mut cycle_manager = ChannelManager::load_manage_list(list_path).await?;
-    println!("✅ 成功加载管理列表");
+    for device in device_list.iter() {
+        let data_path = data_dir.join(&device);
 
-    let data_dir = file_dialog_select("选择数据目录", &[], false).unwrap();
-    let _result = cycle_manager.search_data_dir(data_dir).await?;
-    println!("搜索数据目录完成");
+        if let Ok(dir_read) = fs::read_dir(data_path) {
+            let xlsx_forms: Vec<DataForm> = dir_read
+                .flatten() // 过滤掉错误的entry
+                .map(|entry| entry.path())
+                .filter(|path| path.is_file())
+                .filter(|path| path.extension().map_or(false, |ext| ext == "xlsx"))
+                .filter_map(|path| DataForm::init(&path).ok())
+                .collect();
 
-    println!("💾 选择存储位置");
-
-    let save_path =
-        file_dialog_save("选择存储位置", &["xlsx"], "循环电芯跟踪表(已合并).xlsx").unwrap();
-    let _result = cycle_manager.write_cycle(&save_path).await?;
-    println!("✅ 成功写入循环数据到: {}", save_path.display());
-
-    println!("📁 选择数据移动目标目录");
-
-    let move_target = file_dialog_select("选择数据复制目标目录", &[], false).unwrap();
-    let _result = cycle_manager.move_data(&move_target).await?;
-    println!("✅ 成功移动数据到: {}", move_target.display());
-
-    Ok(())
-}
-async fn run_complete_interactive() -> Result<()> {
-    println!("🚀 开始执行完整流程");
-
-    // 简化实现，实际中可能需要更复杂的路径收集逻辑
-    let list_path = file_dialog_select("选择数据表", &["xlsx"], true).unwrap();
-    let mut cycle_manager = ChannelManager::load_manage_list(list_path).await?;
-    println!("✅ 步骤1/5: 加载管理列表完成");
-
-    let output_dir = file_dialog_select("选择数据导出目录生成位置", &[], false).unwrap();
-    let _result = cycle_manager.crate_output_dir(output_dir).await?;
-    println!("✅ 步骤2/5: 创建输出目录完成");
-
-    let data_dir = file_dialog_select("选择数据目录", &[], false).unwrap();
-    let _result = cycle_manager.search_data_dir(data_dir).await?;
-    println!("✅ 步骤3/5: 搜索数据目录完成");
-
-    let save_path =
-        file_dialog_save("选择存储位置", &["xlsx"], "循环电芯跟踪表(已合并).xlsx").unwrap();
-    let _result = cycle_manager.write_cycle(&save_path).await?;
-    println!("✅ 步骤4/5: 写入循环数据完成");
-
-    let move_target = file_dialog_select("选择数据复制目标目录", &[], false).unwrap();
-    let _result = cycle_manager.move_data(&move_target).await?;
-    println!("✅ 步骤5/5: 复制数据完成");
-
-    println!("🎉 所有步骤执行完成！");
-    Ok(())
-}
-
-fn print_manual() {
-    println!();
-    println!("📖 电芯数据管理工具 - 帮助文档");
-    println!("==============================");
-    println!();
-    println!("使用方法:");
-    println!("  cycle_manager [OPTIONS] [COMMAND]");
-    println!();
-    println!("选项:");
-    println!("  -i, --interactive  进入交互模式");
-    println!();
-    println!("命令:");
-    println!("  load              加载管理列表");
-    println!("  create-output     创建输出目录");
-    println!("  search-data       搜索数据目录");
-    println!("  write-cycle       写入循环数据");
-    println!("  move-data         移动数据");
-    println!("  run               执行完整流程");
-    println!("  help              显示此帮助信息");
-    println!();
-    println!("示例:");
-    println!("  cycle_manager -i                    # 进入交互模式");
-    println!("  cycle_manager load --file data.xlsx # 直接加载文件");
-    println!("  cycle_manager run --list-file data.xlsx --output-dir ./output ...");
-    println!();
-}
-
-// 文件选择对话框辅助函数
-fn file_dialog_select(title: &str, filters: &[&str], is_file: bool) -> Option<PathBuf> {
-    let dialog = FileDialog::new()
-        .set_title(title.to_string())
-        .set_directory("/");
-
-    let dialog = filters
-        .iter()
-        .fold(dialog, |d, filter| d.add_filter("", &[filter]));
-
-    if is_file {
-        dialog.pick_file()
-    } else {
-        dialog.pick_folder()
-    }
-}
-
-fn file_dialog_save(title: &str, filters: &[&str], default_name: &str) -> Option<PathBuf> {
-    let dialog = FileDialog::new()
-        .set_title(title.to_string())
-        .set_directory("/")
-        .set_file_name(default_name);
-
-    let dialog = filters
-        .iter()
-        .fold(dialog, |d, filter| d.add_filter("", &[filter]));
-
-    dialog.save_file()
-}
-
-struct ChannelManager {
-    workbook: Workbook,
-    channels: HashMap<String, Vec<ChannelInfo>>,
-    data_dir: PathBuf,
-    data_info: Vec<DataInfo>,
-}
-
-impl ChannelManager {
-    async fn load_manage_list(file_path: PathBuf) -> Result<Self> {
-        // println!("Loading Channel:{:?}", file_path);
-
-        let workbook = Workbook::from_path(&file_path)
-            .with_context(|| format!("文件读取失败 {:?}", file_path))?;
-
-        let work_sheet = workbook.get_worksheet_by_name("循环中").with_context(|| {
-            "Excel表格式错误，没有找到名为循环中的工作簿，请检查文件格式是否正确".to_string()
-        })?;
-
-        let mut channels = HashMap::new();
-
-        //获取有效通道
-        for row in 2..=work_sheet.max_row() {
-
-            // println!("read for {}",row);
-            if work_sheet.read_cell((row, 4))?.text.is_some() {
-                if work_sheet.read_cell((row, 3))?.text == Some(String::from("长期")) {
-                    let channel_info = ChannelInfo::new(work_sheet, row as u32)?;
-                    // println!("{}", channel_info);
-                    channels
-                        .entry(channel_info.device_name.clone())
-                        .or_insert_with(Vec::new)
-                        .push(channel_info);
-                }
-            } else if work_sheet.read_cell((row, 1))?.text.is_none() {
-                //exit for exception
-                break;
+            if !xlsx_forms.is_empty() {
+                data_dir_list
+                    .entry(device.to_string())
+                    .or_insert_with(Vec::new)
+                    .extend(xlsx_forms);
             }
         }
+    }
 
-        let channel_manager = ChannelManager {
-            workbook,
-            channels,
-            data_dir: PathBuf::new(),
-            data_info: Vec::new(),
+    // println!("{:?}",data_dir_list);
+
+    println!("📁 数据文件已完成索引,开始匹配数据");
+
+    let mut tasks = Vec::new();
+
+    // 预收集所有需要处理的数据，避免在异步闭包中引用外部数据
+    for device in device_list.iter() {
+        // 获取设备对应的数据
+        let Some(device_data) = data_dir_list.get(device) else {
+            continue;
         };
 
-        Ok(channel_manager)
-    }
-    async fn crate_output_dir(&self, crate_data_dir: PathBuf) -> Result<()> {
-        let device_list = self.get_device_list();
+        // 获取设备对应的通道列表
+        let Some(device_channels) = import_list.get(device) else {
+            continue;
+        };
 
-        for device_name in device_list {
-            //crate device folder
-            let device_dir = crate_data_dir.join(&device_name);
-            fs::create_dir_all(&device_dir)?; //crate folder
+        // 为每个通道匹配对应的数据
+        for channel_active in device_channels {
+            let channel_to_match = channel_active.get_channel();
+            let mut matched = false;
 
-            //crate output list
-            let channels = self.channels.get(&device_name).unwrap();
-            let output_channels = channels
-                .iter()
-                .map(|x| x.channel_name.clone())
-                .collect::<Vec<String>>()
-                .join("\n");
-            let output_info = channels
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<String>>()
-                .join("\n");
+            // 首先用 channel 匹配
+            for data in device_data.iter() {
+                if data.channel_eq(&channel_to_match) {
+                    // 克隆需要移动到异步任务中的数据
+                    let device_clone = channel_active.device.clone();
+                    let channel_clone = channel_active.get_channel();
+                    let first_run = channel_active.first_run;
+                    let data_clone = data.clone(); // 假设 Data 实现了 Clone
 
-            let output = format!("导出通道：\n{}\n\n{}", output_channels, output_info);
+                    // 创建异步任务
+                    let task = tokio::spawn(async move {
+                        // println!("{}-{}匹配成功,正在搜索...",device_clone,channel_clone);
+                        let (cycle_num, capacity) = data_clone.get_cycle_last()?;
+                        let form_path = data_clone.get_form_path();
 
-            let file_name = format!("{}导出清单.txt", device_name);
-            // let file_name = "导出清单.txt";
+                        if first_run {
+                            let (_, first_capacity) = data_clone.get_cycle_first()?;
+                            // println!("{}-{}搜索完成,循环次数{},当前容量{}",device_clone,channel_clone,cycle_num,capacity);
+                            return Ok::<_, Error>((
+                                device_clone,
+                                channel_clone,
+                                cycle_num,
+                                capacity,
+                                form_path,
+                                Some(first_capacity),
+                            ));
+                        }
 
-            let file_path = device_dir.join(file_name);
+                        Ok((
+                            device_clone,
+                            channel_clone,
+                            cycle_num,
+                            capacity,
+                            form_path,
+                            None,
+                        ))
+                    });
 
-            fs::write(&file_path, output)?;
-        }
-        Ok(())
-    }
-    async fn search_data_dir(&mut self, data_dir: PathBuf) -> Result<()> {
-        //开始搜索数据目录，获取基础信息
-        let mut data_info = Vec::new();
-        let device_list = self.get_device_list();
-
-        // println!("Loading Data:{:?}", device_list);
-
-        for device_name in device_list {
-            let data_files = match DataInfo::get_data_info(&data_dir, &device_name).await {
-                Ok(d) => d,
-                Err(e) => {
-                    println!("ERROR:{}", e);
-                    continue;
-                }
-            };
-            data_info.extend(data_files);
-        }
-
-        self.data_dir = data_dir;
-        self.data_info = data_info;
-
-        println!("数据目录读取完成！");
-
-        Ok(())
-    }
-    async fn write_cycle(&mut self, save_path: &PathBuf) -> Result<()> {
-        let work_sheet = self
-            .workbook
-            .get_worksheet_mut_by_name("循环中")
-            .with_context(|| {
-                "Excel表格式错误，没有找到名为循环中的工作簿，请检查文件格式是否正确".to_string()
-            })?;
-
-        for data_info in &self.data_info {
-            let device_name = &data_info.device_name;
-            let channel_name = &data_info.channel_name;
-            let data_path = &data_info.data_path;
-
-            println!("正在搜索... 设备号:{} 通道号:{}", device_name, channel_name);
-            for row in 2..=work_sheet.max_row() {
-                if work_sheet.read_cell((row, 1))?.text == Some(device_name.to_string()) {
-                    if work_sheet.read_cell((row, 2))?.text == Some(channel_name.to_string()) {
-                        //read data from files
-                        let (cycle_num, cycle_capacity) = DataInfo::get_shenghong_data(&data_path)
-                            .await
-                            .unwrap_or((0, 0.0));
-                        //write into it
-                        work_sheet.write((row, 22), cycle_num)?;
-                        work_sheet.write((row, 23), cycle_capacity)?;
-                        // println!("write to sheet with {},{}", cycle_num, cycle_capacity);
-                        continue;
-                    }
+                    tasks.push(task);
+                    matched = true;
+                    break; // 找到一个匹配就跳出内层循环，避免重复处理
                 }
             }
-        }
 
-        self.workbook.save_as(save_path)?;
+            // 如果 channel 没有匹配成功，尝试使用 prv 匹配
+            if !matched {
+                let channel_prv_to_match = channel_active.get_channel_prv();
 
-        println!("写入完成，文件已保存到：{}", save_path.display());
-        Ok(())
-    }
-    async fn move_data(&self, new_data_path: &PathBuf) -> Result<()> {
-        //match datainfo with channelinfo
-        for data_info in &self.data_info {
-            let device_name = &data_info.device_name;
-            let channel_name = &data_info.channel_name;
-            let data_path = &data_info.data_path;
+                for data in device_data.iter() {
+                    if data.channel_eq(&channel_prv_to_match) {
+                        // 克隆需要移动到异步任务中的数据
+                        let device_clone = channel_active.device.clone();
+                        let channel_clone = channel_active.get_channel_prv();
+                        let first_run = channel_active.first_run;
+                        let data_clone = data.clone();
 
-            let channels = self.channels.get(device_name).unwrap();
-            //match channel name
-            for channel in channels {
-                if channel.channel_name.eq(channel_name) {
-                    let new_path = new_data_path.join(channel.crate_path());
-                    let _result = move_file_with_checks(data_path, &new_path);
+                        // 创建异步任务
+                        let task = tokio::spawn(async move {
+                            // println!("{}-{}匹配成功,正在搜索...",device_clone,channel_clone);
+                            let (cycle_num, capacity) = data_clone.get_cycle_last()?;
+                            let form_path = data_clone.get_form_path();
 
-                    continue;
-                }
-            }
-        }
-        Ok(())
-    }
-    fn get_device_list(&self) -> Vec<String> {
-        let device_list: Vec<_> = self.channels.keys().cloned().collect(); //提取设备编号
-        device_list
-    }
-}
-struct DataInfo {
-    data_path: PathBuf,
-    device_name: String,
-    channel_name: String,
-}
-
-impl DataInfo {
-    async fn get_data_info(dir_path: &PathBuf, device_name: &str) -> Result<Vec<DataInfo>> {
-        let full_path = dir_path.join(device_name);
-        let path = Path::new(&full_path);
-        let mut data_info = Vec::new();
-
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            // 检查是否是文件且有xlsx后缀
-            if path.is_file() {
-                if let Some(extension) = path.extension() {
-                    if extension == "xlsx" {
-                        let file_name = path.file_stem().unwrap().to_str().unwrap().to_string();
-                        let channel_name = match match_channel_name(&file_name) {
-                            Some(c) => c,
-                            None => {
-                                println!("通道名获取失败，尝试进入文件查询");
-                                DataInfo::get_shenghong_channel(&path)
-                                    .await
-                                    .unwrap_or(String::new())
+                            if first_run {
+                                let (_, first_capacity) = data_clone.get_cycle_first()?;
+                                // println!("{}-{}搜索完成,循环次数{},当前容量{}",device_clone,channel_clone,cycle_num,capacity);
+                                return Ok::<_, Error>((
+                                    device_clone,
+                                    channel_clone,
+                                    cycle_num,
+                                    capacity,
+                                    form_path,
+                                    Some(first_capacity),
+                                ));
                             }
-                        };
 
-                        data_info.push(DataInfo {
-                            data_path: path,
-                            device_name: device_name.to_string(),
-                            channel_name,
-                        })
+                            Ok((
+                                device_clone,
+                                channel_clone,
+                                cycle_num,
+                                capacity,
+                                form_path,
+                                None,
+                            ))
+                        });
+
+                        tasks.push(task);
+                        break; // 找到一个匹配就跳出内层循环，避免重复处理
                     }
                 }
             }
         }
-        Ok(data_info)
     }
 
-    async fn get_shenghong_data(file_path: &PathBuf) -> Result<(u32, f32)> {
-        let read_book = Workbook::from_path(file_path)
-            .with_context(|| format!("文件读取失败 {}", file_path.to_str().unwrap()))?;
-
-        let cycle_sheet = read_book
-            .get_worksheet_by_name("循环数据表")
-            .with_context(|| {
-                "Excel表格式错误，没有找到名为循环数据表的工作簿，请检查文件是否为盛洪BTS生成"
-                    .to_string()
-            })?;
-
-        let max_cycle = cycle_sheet.max_row() - 1; //for last for no use
-        let cycle_num = cycle_sheet.read_cell((max_cycle, 1))?;
-        let cycle_capacity = cycle_sheet.read_cell((max_cycle, 3))?;
-
-        //parse cycle data
-        let cycle_num: u32 = cycle_num.text.unwrap().parse()?;
-        let cycle_capacity: f32 = cycle_capacity.text.unwrap().parse()?;
-        println!("循环计数:{},放电容量:{}", cycle_num, cycle_capacity);
-
-        Ok((cycle_num, cycle_capacity))
-    }
-
-    async fn get_shenghong_channel(file_path: &PathBuf) -> Result<String> {
-        let read_book = Workbook::from_path(file_path)
-            .with_context(|| format!("文件读取失败 {}", file_path.to_str().unwrap()))?;
-
-        let data_sheet = read_book.get_worksheet_by_name("数据表").with_context(|| {
-            "Excel表格式错误，没有找到名为数据表的工作簿，请检查文件是否为盛洪BTS生成".to_string()
-        })?;
-
-        let cell_num = data_sheet.read_cell((3, 2))?;
-        let channel_num = data_sheet.read_cell((4, 2))?;
-
-        let channel_name = format!("{}-{}", cell_num.text.unwrap(), channel_num.text.unwrap());
-
-        println!("查询成功，通道号：{}", channel_name);
-
-        Ok(channel_name)
-    }
-}
-#[derive(Debug)]
-struct ChannelInfo {
-    device_name: String,
-    channel_name: String,
-    sample_num: String,
-    data_name: String,
-    test_code: String,
-    sample_fmt: SampleFmt,
-    test_temperature: TestTemperature,
-}
-
-impl ChannelInfo {
-    fn new(work_sheet: &WorkSheet, row_num: u32) -> Result<Self> {
-        let device_name = work_sheet.read_cell((row_num, 1))?.text.unwrap();
-
-        let channel_name = work_sheet.read_cell((row_num, 2))?.text.unwrap();
-
-        let test_code = work_sheet.read_cell((row_num, 4))?.text.unwrap();
-
-        let sample_num = work_sheet
-            .read_cell((row_num, 9))?
-            .text
-            .unwrap_or(String::from("无编号"));
-
-        let data_name = work_sheet.read_cell((row_num, 10))?.text.unwrap();
-
-        let sample_fmt = SampleFmt::from(
-            &work_sheet
-                .read_cell((row_num, 6))?
-                .text
-                .unwrap_or(String::new()),
-        );
-
-        let test_temperature = TestTemperature::from(
-            &work_sheet
-                .read_cell((row_num, 14))?
-                .text
-                .unwrap_or(String::new()),
-        );
-
-        let channel_info = ChannelInfo {
-            device_name,
-            channel_name,
-            sample_num,
-            data_name,
-            test_code,
-            sample_fmt,
-            test_temperature,
-        };
-
-        Ok(channel_info)
-    }
-    fn crate_path(&self) -> String {
-        let file_name = format!(
-            "{}/{}/{}/{}.xlsx",
-            self.sample_fmt, self.test_code, self.test_temperature, self.data_name
-        );
-        file_name
-    }
-}
-
-impl fmt::Display for TestTemperature {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            TestTemperature::T25 => write!(f, "25℃"),
-            TestTemperature::T35 => write!(f, "35℃"),
-            TestTemperature::T45 => write!(f, "45℃"),
-            TestTemperature::T55 => write!(f, "55℃"),
-            TestTemperature::None => write!(f, "未设置"),
-        }
-    }
-}
-
-impl fmt::Display for SampleFmt {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            SampleFmt::H50 => write!(f, "铝壳50"),
-            SampleFmt::H65 => write!(f, "铝壳65"),
-            SampleFmt::H100 => write!(f, "铝壳100"),
-            SampleFmt::H150 => write!(f, "铝壳150"),
-            SampleFmt::H180 => write!(f, "铝壳180"),
-            SampleFmt::H280 => write!(f, "铝壳280"),
-            SampleFmt::S50 => write!(f, "软包50"),
-            SampleFmt::Na165 => write!(f, "钠电165"),
-            SampleFmt::Na170 => write!(f, "钠电170"),
-            SampleFmt::None => write!(f, "未设置"),
-        }
-    }
-}
-
-// 为 ChannelInfo 实现 Display trait
-impl fmt::Display for ChannelInfo {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "通道信息")?;
-        writeln!(f, "┌{}", "─".repeat(50))?;
-        writeln!(f, "│ 设备名称: {}", self.device_name)?;
-        writeln!(f, "│ 通道名称: {}", self.channel_name)?;
-        writeln!(f, "│ 样品编号: {}", self.sample_num)?;
-        writeln!(f, "│ 数据名称: {}", self.data_name)?;
-        writeln!(f, "│ 测试代码: {}", self.test_code)?;
-        writeln!(f, "│ 样品规格: {}", self.sample_fmt)?;
-        writeln!(f, "│ 测试温度: {}", self.test_temperature)?;
-        write!(f, "└{}", "─".repeat(50))
-    }
-}
-
-#[derive(Debug)]
-enum TestTemperature {
-    T25,
-    T35,
-    T45,
-    T55,
-    None,
-}
-
-impl TestTemperature {
-    fn from(text: &str) -> Self {
-        let pattern = r"(25℃|35℃|45℃|55℃)";
-        let re = Regex::new(pattern).unwrap();
-
-        if let Some(mat) = re.find(text) {
-            match mat.as_str() {
-                "25℃" => TestTemperature::T25,
-                "35℃" => TestTemperature::T35,
-                "45℃" => TestTemperature::T45,
-                "55℃" => TestTemperature::T55,
-                _ => TestTemperature::None,
+    //catch result
+    // 收集所有任务结果
+    let mut results = Vec::new();
+    for task in tasks {
+        let task = task.await;
+        match task {
+            Ok(Ok(result)) => {
+                // 任务成功且内部操作成功
+                println!(
+                    "{}-{}搜索完成,循环次数{},当前容量{}",
+                    result.0, result.1, result.2, result.3
+                );
+                results.push(result);
             }
-        } else {
-            TestTemperature::None
+            Ok(Err(e)) => {
+                // 任务成功但内部操作失败
+                eprintln!("Task error: {}", e);
+            }
+            Err(e) => {
+                // 任务本身失败（如 panic）
+                eprintln!("Join error: {}", e);
+            }
+        }
+        // println!("ping");
+    }
+
+    println!("读取完成，开始更新...");
+
+    //update data into channel info
+    let mut data_write = data.write().await;
+    for (device, channel, cycle_num, capacity, form_path, first_run) in results {
+        let index = find_channel_info_index(&data_write, &device, &channel);
+        match index {
+            Some(index) => {
+                data_write[index].update_capacity(capacity);
+                data_write[index].update_cycles(cycle_num as usize);
+                data_write[index].update_form_path(form_path);
+                if first_run.is_some() {
+                    data_write[index].update_initial_capacity(first_run.unwrap());
+                }
+            }
+            None => {
+                continue;
+            }
         }
     }
+
+    println!("✅ 数据采集与更新完成");
+
+    Ok(())
 }
 
-#[derive(Debug)]
-enum SampleFmt {
-    H50,
-    H65,
-    H100,
-    H150,
-    H180,
-    H280,
-    S50,
-    Na165,
-    Na170,
-    None,
-}
+async fn read_update_cycle_v2(data: Arc<RwLock<Vec<ChannelInfo>>>) -> Result<()> {
+    // 1. 读取并处理数据
+    let import_list = {
+        let data_read = data.read().await;
 
-impl SampleFmt {
-    fn from(text: &str) -> Self {
-        match text {
-            "铝壳50" => SampleFmt::H50,
-            "65" => SampleFmt::H65,
-            "100" => SampleFmt::H100,
-            "150" => SampleFmt::H150,
-            "180" => SampleFmt::H180,
-            "280" => SampleFmt::H280,
-            "软包50" => SampleFmt::S50,
-            "钠电165" => SampleFmt::Na165,
-            "钠电170" => SampleFmt::Na170,
-            _ => SampleFmt::None,
+        if data_read.is_empty() {
+            println!("❌ 列表为空,停止导出");
+            return Ok(());
         }
-    }
-}
 
-fn match_channel_name(input: &str) -> Option<String> {
-    // 匹配 UN 后面的数字和 CN 后面的数字，顺序无关
-    let re = Regex::new(r"UN(\d+).*?CN(\d+)|CN(\d+).*?UN(\d+)").unwrap();
+        // 使用 HashMap 分组收集活跃通道
+        let mut import_list = HashMap::<String, Vec<ChannelActive>>::new();
 
-    let caps = re.captures(input)?;
+        for channel_info in data_read.iter() {
+            if let Some(channel_active) = channel_info.get_active() {
+                let device = channel_info.get_device();
+                import_list
+                    .entry(device.to_string())
+                    .or_default()
+                    .push(channel_active);
+            }
+        }
 
-    let (un_num, cn_num) = if caps.get(1).is_some() {
-        // UN在前，CN在后的情况
-        (caps.get(1).unwrap().as_str(), caps.get(2).unwrap().as_str())
-    } else {
-        // CN在前，UN在后的情况
-        (caps.get(4).unwrap().as_str(), caps.get(3).unwrap().as_str())
+        import_list
     };
 
-    // 去除前导零
-    let un_clean = un_num.trim_start_matches('0');
-    let cn_clean = cn_num.trim_start_matches('0');
+    if import_list.is_empty() {
+        println!("❌ 没有活跃通道需要处理");
+        return Ok(());
+    }
 
-    // 如果去除零后为空字符串，则使用 "0"
-    let un_final = if un_clean.is_empty() { "0" } else { un_clean };
-    let cn_final = if cn_clean.is_empty() { "0" } else { cn_clean };
+    // 2. 选择数据目录
+    println!("📁 数据准备完成,选择数据采集目录");
 
-    Some(format!("{}-{}", un_final, cn_final))
+    let data_dir = FileDialog::new()
+        .set_title("选择数据采集目录")
+        .set_directory("/")
+        .pick_folder()
+        .context("未选择目录")?;
+
+    // 3. 读取和索引数据文件
+    let data_dir_list = build_data_dir_list(&import_list, &data_dir).await?;
+
+    if data_dir_list.is_empty() {
+        println!("❌ 未找到任何数据文件");
+        return Ok(());
+    }
+
+    println!("📁 数据文件已完成索引,开始匹配数据");
+
+    // 4. 创建并执行匹配任务
+    let tasks = create_matching_tasks(&import_list, &data_dir_list);
+
+    // 5. 收集任务结果
+    let results = collect_task_results(tasks).await;
+
+    if results.is_empty() {
+        println!("⚠️  未找到任何匹配的数据");
+        return Ok(());
+    }
+
+    println!("读取完成，开始更新...");
+
+    // 6. 更新数据
+    update_channel_data(data, &results).await;
+
+    println!("✅ 数据采集与更新完成");
+    Ok(())
 }
 
-fn move_file_with_checks(source: &PathBuf, destination: &PathBuf) -> Result<()> {
+/// 收集任务结果
+async fn collect_task_results(
+    tasks: Vec<tokio::task::JoinHandle<Result<MatchResult>>>,
+) -> Vec<MatchResult> {
+    let mut results = Vec::new();
+
+    for task in tasks {
+        match task.await {
+            Ok(Ok(result)) => {
+                println!(
+                    "{}-{}搜索完成,循环次数{},当前容量{}",
+                    result.0, result.1, result.2, result.3
+                );
+                results.push(result);
+            }
+            Ok(Err(e)) => {
+                eprintln!("任务处理错误: {}", e);
+            }
+            Err(e) => {
+                eprintln!("任务执行失败: {}", e);
+            }
+        }
+    }
+
+    results
+}
+
+/// 创建匹配任务的辅助函数
+fn create_matching_tasks(
+    import_list: &HashMap<String, Vec<ChannelActive>>,
+    data_dir_list: &HashMap<String, Vec<DataForm>>,
+) -> Vec<tokio::task::JoinHandle<Result<MatchResult>>> {
+    let mut tasks = Vec::new();
+
+    for (device, device_channels) in import_list {
+        let Some(device_data) = data_dir_list.get(device) else {
+            continue;
+        };
+
+        // 为设备数据建立索引以提高匹配效率
+        let channel_index = build_channel_index(device_data);
+
+        for channel_active in device_channels {
+            // 尝试匹配通道
+            if let Some(task) = try_match_channel(device, channel_active, &channel_index) {
+                tasks.push(task);
+                continue;
+            }
+
+            // 尝试匹配通道PRV
+            if let Some(task) = try_match_channel_prv(device, channel_active, &channel_index) {
+                tasks.push(task);
+            }
+        }
+    }
+
+    tasks
+}
+
+/// 构建通道索引
+fn build_channel_index(data_forms: &[DataForm]) -> HashMap<String, &DataForm> {
+    let mut index = HashMap::new();
+    for data in data_forms {
+        // 这里需要根据 DataForm 的实际字段调整
+        // 假设 DataForm 有 channel_id 字段
+        index.insert(data.get_channel(), data);
+    }
+    index
+}
+
+/// 尝试匹配通道
+fn try_match_channel(
+    device: &str,
+    channel_active: &ChannelActive,
+    channel_index: &HashMap<String, &DataForm>,
+) -> Option<tokio::task::JoinHandle<Result<MatchResult>>> {
+    let channel_to_match = channel_active.get_channel();
+
+    // 使用索引快速查找
+    // 这里需要根据实际数据结构调整
+    if let Some(data) = channel_index.get(&channel_to_match) {
+        return Some(create_task(device.to_string(), channel_to_match, channel_active.first_run, data));
+    }
+
+    None // 临时返回，需要根据实际情况实现
+}
+
+/// 尝试匹配通道PRV
+fn try_match_channel_prv(
+    device: &str,
+    channel_active: &ChannelActive,
+    channel_index: &HashMap<String, &DataForm>,
+) -> Option<tokio::task::JoinHandle<Result<MatchResult>>> {
+    let channel_prv_to_match = channel_active.get_channel_prv();
+
+    // 使用索引快速查找
+    // 这里需要根据实际数据结构调整
+    if let Some(data) = channel_index.get(&channel_prv_to_match) {
+        return Some(create_task(device.to_string(), channel_prv_to_match, channel_active.first_run, data));
+    }
+
+    None // 临时返回，需要根据实际情况实现
+}
+
+
+/// 创建异步任务
+fn create_task(
+    device: String,
+    channel: String,
+    first_run: bool,
+    data: &DataForm,
+) -> tokio::task::JoinHandle<Result<MatchResult>> {
+    let data_clone = data.clone(); // 假设 DataForm 实现了 Clone
+
+    tokio::spawn(async move {
+        let (cycle_num, capacity) = data_clone.get_cycle_last()?;
+        let form_path = data_clone.get_form_path();
+
+        let first_capacity = if first_run {
+            Some(data_clone.get_cycle_first()?.1)
+        } else {
+            None
+        };
+
+        Ok((device, channel, cycle_num, capacity, form_path, first_capacity))
+    })
+}
+
+/// 构建数据目录列表
+async fn build_data_dir_list(
+    import_list: &HashMap<String, Vec<ChannelActive>>,
+    data_dir: &PathBuf,
+) -> Result<HashMap<String, Vec<DataForm>>> {
+    use tokio::fs;
+
+    let mut data_dir_list = HashMap::new();
+
+    for device in import_list.keys() {
+        let data_path = data_dir.join(device);
+
+        if let Ok(mut dir_read) = fs::read_dir(&data_path).await {
+            let mut xlsx_forms = Vec::new();
+
+            while let Some(entry) = dir_read.next_entry().await? {
+                let path = entry.path();
+
+                if !path.is_file() {
+                    continue;
+                }
+
+                if path.extension().map_or(false, |ext| ext == "xlsx") {
+                    if let Ok(data_form) = DataForm::init(&path) {
+                        xlsx_forms.push(data_form);
+                    }
+                }
+            }
+
+            if !xlsx_forms.is_empty() {
+                data_dir_list.insert(device.clone(), xlsx_forms);
+            }
+        }
+    }
+
+    Ok(data_dir_list)
+}
+
+/// 通道匹配结果类型
+type MatchResult = (String, String, u32, f32, PathBuf, Option<f32>);
+
+/// 更新通道数据
+async fn update_channel_data(
+    data: Arc<RwLock<Vec<ChannelInfo>>>,
+    results: &[MatchResult],
+) {
+    let mut data_write = data.write().await;
+
+    for (device, channel, cycle_num, capacity, form_path, first_capacity) in results {
+        if let Some(index) = find_channel_info_index(&data_write, device, channel) {
+            data_write[index].update_capacity(*capacity);
+            data_write[index].update_cycles(*cycle_num as usize);
+            data_write[index].update_form_path(form_path.clone());
+
+            if let Some(first_cap) = first_capacity {
+                data_write[index].update_initial_capacity(*first_cap);
+            }
+        }
+    }
+}
+
+fn copy_file_with_checks(source: &PathBuf, destination: &PathBuf) -> Result<()> {
     // let source = "source_file.txt";
     // let destination = "target_dir/moved_file.txt";
 
@@ -655,48 +679,921 @@ fn move_file_with_checks(source: &PathBuf, destination: &PathBuf) -> Result<()> 
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::Result;
+fn find_channel_info_index<'a>(
+    infos: &'a Vec<ChannelInfo>,
+    device: &str,
+    channel: &str,
+) -> Option<usize> {
+    infos.iter().enumerate().find_map(|(idx, info)| {
+        if info.device == device
+            && (info.channel == channel || info.channel_prv.as_deref() == Some(channel))
+        {
+            Some(idx)
+        } else {
+            None
+        }
+    })
+}
 
-    #[test]
-    fn test_check_channel_by_file_name() -> Result<()> {
-        let test_cases = vec![
-            "UN152_CN01_456446545321",
-            "CN01_UN152_456446545321", // 顺序互换
-            "UN001_CN005_123456",
-            "CN005_UN001_123456", // 顺序互换
-            "UN0_CN00_123456",
-            "CN10_UN20_123456",
-        ];
+async fn create_import_dir(data: Arc<RwLock<Vec<ChannelInfo>>>) -> Result<()> {
+    let data_read = data.read().await;
 
-        for test_case in test_cases {
-            if let Some(result) = match_channel_name(test_case) {
-                println!("输入: {} -> 输出: {}", test_case, result);
-            } else {
-                println!("输入: {} -> 无法匹配", test_case);
+    if data_read.len() == 0 {
+        println!("❌ 列表为空,停止导出");
+        return Ok(());
+    }
+
+    let mut import_list = HashMap::new();
+
+    for channel_info in data_read.iter() {
+        if channel_info.test_status.is_long() {
+            let device = &channel_info.device;
+            let channel = &channel_info.channel;
+            let channel_prv = &channel_info
+                .channel_prv
+                .clone()
+                .unwrap_or(String::from("N/A"));
+            let project_code = &channel_info.project_code;
+
+            if !project_code.is_empty() {
+                let info = format!(
+                    "通道号：{} 项目编号：{} 曾用通道号：{}",
+                    channel, project_code, channel_prv
+                );
+
+                import_list
+                    .entry(device.to_string())
+                    .or_insert_with(Vec::new)
+                    .push(info);
+            }
+        }
+    }
+
+    println!("📁 数据准备完成,选择目录生成位置");
+    let current_date = Local::now().format("%Y%m%d").to_string();
+    let default_folder_name = format!("循环数据采集{}", current_date);
+
+    let dialog = FileDialog::new()
+        .set_title("选择目录生成位置")
+        .set_directory("/");
+
+    let dialog = dialog.pick_folder();
+
+    let crate_data_dir = if let Some(folder) = dialog {
+        folder.join(&default_folder_name)
+    } else {
+        println!("❌ 未选择目录");
+        return Ok(());
+    };
+
+    let device_list: Vec<String> = import_list.keys().cloned().collect();
+
+    for device_name in device_list {
+        //crate device folder
+        let device_dir = crate_data_dir.join(&device_name);
+        fs::create_dir_all(&device_dir)?; //crate folder
+
+        //crate output list
+        let channels = import_list.get(&device_name).unwrap();
+        let output_channels = channels
+            .iter()
+            .map(|x| x.clone())
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let output = format!("导出通道：\n{}", output_channels);
+
+        let file_name = format!("{}导出清单.txt", device_name);
+
+        let file_path = device_dir.join(file_name);
+
+        fs::write(&file_path, output)?;
+    }
+
+    println!("✅ 数据采集目录生成完成");
+    Ok(())
+}
+
+async fn print_data(data: Arc<RwLock<Vec<ChannelInfo>>>) {
+    let data_read = data.read().await;
+
+    print_channel_list_table(&data_read);
+}
+
+async fn import_data_from_list(data: Arc<RwLock<Vec<ChannelInfo>>>) -> Result<()> {
+    println!("📁 选择数据表文件");
+    let dialog = FileDialog::new()
+        .set_title("选择数据表文件")
+        .set_directory("/")
+        .add_filter("Excel表格", &["xlsx"])
+        .pick_file();
+
+    let path = if let Some(file) = dialog {
+        file
+    } else {
+        println!("❌ 未选择文件");
+        return Ok(());
+    };
+
+    let new = xlsx_reader(&path);
+
+    let new_data: Vec<ChannelInfo> = match new {
+        Ok(new_data) => new_data,
+        Err(e) => {
+            println!("❌ 文件读取错误:{:?}", e);
+            return Ok(());
+        }
+    };
+
+    let mut data_write = data.write().await;
+
+    data_write.clear();
+    data_write.extend(new_data);
+
+    println!("✅ 成功加载管理列表");
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ChannelActive {
+    device: String,
+    channel: String,
+    channel_prv: Option<String>,
+    first_run: bool,
+}
+
+impl ChannelActive {
+    pub(crate) fn get_channel_prv(&self) -> String {
+        self.channel_prv.clone().unwrap_or(String::from("N/A"))
+    }
+}
+
+impl ChannelActive {
+    fn get_channel(&self) -> String {
+        self.channel.clone()
+    }
+}
+
+#[derive(Debug)]
+struct ColumnIndices {
+    device: usize,
+    channel: usize,
+    project_code: usize,
+    sample_person: Option<usize>, // 可选
+    sample_model: usize,
+    sample_id: usize,
+    test_status: usize,
+    test_temperature: usize,
+    initial_capacity: usize,
+    current_capacity: usize,
+    previous_cycles: usize,
+    current_cycles: usize,
+    channel_prv: Option<usize>, // 可选
+}
+
+impl ColumnIndices {
+    fn from_header_row(row: &[Data]) -> Result<Self> {
+        let mut indices = Self {
+            device: usize::MAX,
+            channel: usize::MAX,
+            project_code: usize::MAX,
+            sample_person: None,
+            sample_model: usize::MAX,
+            sample_id: usize::MAX,
+            test_status: usize::MAX,
+            test_temperature: usize::MAX,
+            initial_capacity: usize::MAX,
+            current_capacity: usize::MAX,
+            previous_cycles: usize::MAX,
+            current_cycles: usize::MAX,
+            channel_prv: None,
+        };
+
+        for (index, cell) in row.iter().enumerate() {
+            let text = cell.to_string();
+            match text.trim() {
+                "上位机" => indices.device = index,
+                "测试通道" => indices.channel = index,
+                "申请单号" => indices.project_code = index,
+                "送样人" => indices.sample_person = Some(index),
+                "电芯型号" => indices.sample_model = index,
+                "电芯编号" => indices.sample_id = index,
+                "测试状态" => indices.test_status = index,
+                "测试温度" | "测试方法" => indices.test_temperature = index,
+                "初始容量" => indices.initial_capacity = index,
+                "当前容量" => indices.current_capacity = index,
+                "接续前圈数" => indices.previous_cycles = index,
+                "当前圈数" => indices.current_cycles = index,
+                "先前测试通道" => indices.channel_prv = Some(index),
+                _ => {}
             }
         }
 
-        Ok(())
+        // 检查必填列是否存在
+        let required_fields = [
+            ("上位机", indices.device),
+            ("测试通道", indices.channel),
+            ("申请单号", indices.project_code),
+            ("电芯型号", indices.sample_model),
+            ("电芯编号", indices.sample_id),
+            ("测试状态", indices.test_status),
+            ("测试温度/测试方法", indices.test_temperature),
+            ("初始容量", indices.initial_capacity),
+            ("当前容量", indices.current_capacity),
+            ("接续前圈数", indices.previous_cycles),
+            ("当前圈数", indices.current_cycles),
+        ];
+
+        for (field_name, index) in required_fields {
+            if index == usize::MAX {
+                bail!("表格格式非法：没有{}信息", field_name);
+            }
+        }
+
+        Ok(indices)
+    }
+}
+// 辅助函数
+fn cell_to_string(row: &[Data], index: usize) -> String {
+    row.get(index)
+        .map(|data| data.to_string())
+        .unwrap_or_default()
+}
+
+fn parse_cell_f32(row: &[Data], index: usize) -> Option<f32> {
+    row.get(index)
+        .and_then(|data| data.to_string().parse::<f32>().ok())
+}
+
+fn parse_cell_usize(row: &[Data], index: usize) -> Option<usize> {
+    row.get(index)
+        .and_then(|data| data.to_string().parse::<usize>().ok())
+}
+
+// 写入 ChannelInfo 到 Excel 文件
+pub fn write_channel_info_to_xlsx(
+    channels: &[ChannelInfo],
+    output_path: &Path,
+) -> Result<(), XlsxError> {
+    if channels.is_empty() {
+        return Err(XlsxError::ParameterError("没有通道数据可写入".to_string()));
     }
 
-    #[test]
-    fn test_check_device_integration() -> Result<()> {
-        // 这是一个集成测试的示例框架
-        // 在实际测试中，你需要：
-        // 1. 设置测试用的Excel文件
-        // 2. 创建CycleManageList实例
-        // 3. 调用check_device方法
+    // 创建新的 Excel 文件
+    let mut workbook = Workbook::new();
 
-        // 伪代码：
-        // let test_dir = create_test_directory();
-        // let test_file = create_test_excel_file();
-        // let cycle_list = CycleManageList::new(&test_dir)?;
-        // let result = cycle_list.check_device()?;
+    // 创建工作表
+    let worksheet = workbook.add_worksheet();
 
-        println!("Integration test framework ready");
-        Ok(())
+    // 设置列宽
+    worksheet.set_column_width(0, 10)?; // 上位机
+    worksheet.set_column_width(1, 10)?; // 测试通道
+    worksheet.set_column_width(2, 15)?; // 申请单号
+    worksheet.set_column_width(3, 10)?; // 送样人
+    worksheet.set_column_width(4, 10)?; // 电芯型号
+    worksheet.set_column_width(5, 12)?; // 电芯编号
+    worksheet.set_column_width(6, 10)?; // 测试状态
+    worksheet.set_column_width(7, 12)?; // 测试温度
+    worksheet.set_column_width(8, 12)?; // 初始容量
+    worksheet.set_column_width(9, 12)?; // 当前容量
+    worksheet.set_column_width(10, 12)?; // 接续前圈数
+    worksheet.set_column_width(11, 12)?; // 当前圈数
+    worksheet.set_column_width(12, 15)?; // 先前测试通道
+
+    // 创建表头格式
+    let header_format = Format::new()
+        .set_bold()
+        .set_border(FormatBorder::Thin)
+        .set_align(FormatAlign::Center);
+
+    // 创建数值格式
+    let number_format = Format::new().set_num_format("0.00");
+    let integer_format = Format::new().set_num_format("0");
+
+    // 写入表头
+    let headers = [
+        "上位机",
+        "测试通道",
+        "申请单号",
+        "送样人",
+        "电芯型号",
+        "电芯编号",
+        "测试状态",
+        "测试温度",
+        "初始容量",
+        "当前容量",
+        "接续前圈数",
+        "当前圈数",
+        "先前测试通道",
+    ];
+
+    for (col, header) in headers.iter().enumerate() {
+        worksheet.write_with_format(0, col as u16, *header, &header_format)?;
+    }
+
+    // 写入数据行
+    for (row_idx, channel) in channels.iter().enumerate() {
+        let row = (row_idx + 1) as u32; // 从第2行开始（表头在第1行）
+
+        // 上位机
+        worksheet.write(row, 0, &channel.device)?;
+
+        // 测试通道
+        worksheet.write(row, 1, &channel.channel)?;
+
+        // 申请单号
+        worksheet.write(row, 2, &channel.project_code)?;
+
+        // 送样人（可选）
+        if let Some(person) = &channel.sample_person {
+            worksheet.write(row, 3, person)?;
+        }
+
+        // 电芯型号
+        worksheet.write(row, 4, channel.sample_model.to_string())?;
+
+        // 电芯编号
+        worksheet.write(row, 5, &channel.sample_id)?;
+
+        // 测试状态
+        worksheet.write(row, 6, channel.test_status.to_string())?;
+
+        // 测试温度
+        worksheet.write(row, 7, channel.test_temperature.to_string())?;
+
+        // 初始容量（可选，带格式）
+        if let Some(capacity) = channel.initial_capacity {
+            worksheet.write_with_format(row, 8, capacity, &number_format)?;
+        }
+
+        // 当前容量（可选，带格式）
+        if let Some(capacity) = channel.current_capacity {
+            worksheet.write_with_format(row, 9, capacity, &number_format)?;
+        }
+
+        // 接续前圈数（可选，带格式）
+        if let Some(cycles) = channel.previous_cycles {
+            worksheet.write_with_format(row, 10, cycles as i64, &integer_format)?;
+        }
+
+        // 当前圈数（可选，带格式）
+        if let Some(cycles) = channel.current_cycles {
+            worksheet.write_with_format(row, 11, cycles as i64, &integer_format)?;
+        }
+
+        // 先前测试通道（可选）
+        if let Some(channel_prv) = &channel.channel_prv {
+            worksheet.write(row, 12, channel_prv)?;
+        }
+    }
+
+    // 添加自动筛选
+    worksheet.autofilter(0, 0, 0, 12)?;
+
+    // 冻结第一行（表头）
+    worksheet.set_freeze_panes(1, 0)?;
+
+    // 保存文件
+    workbook.save(output_path)?;
+
+    println!("✅ 数据已成功写入到: {}", output_path.display());
+    Ok(())
+}
+
+fn xlsx_reader(path: &PathBuf) -> Result<Vec<ChannelInfo>> {
+    let mut reader: Xlsx<_> = open_workbook(path).context("无法打开文件")?;
+
+    let sheet = reader
+        .worksheet_range(CYCLE_SHEET)
+        .context("找不到指定工作表")?;
+
+    let rows: Vec<_> = sheet.rows().collect();
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let indices = ColumnIndices::from_header_row(rows[0])?;
+
+    let channel_list = rows
+        .iter()
+        .skip(1)
+        .filter_map(|row| {
+            // 跳过设备列为空的行
+            row.get(indices.device)?;
+
+            Some(ChannelInfo {
+                device: cell_to_string(row, indices.device),
+                channel: cell_to_string(row, indices.channel),
+                channel_prv: indices
+                    .channel_prv
+                    .and_then(|i| Some(cell_to_string(row, i))),
+                project_code: cell_to_string(row, indices.project_code),
+                sample_person: indices
+                    .sample_person
+                    .and_then(|i| Some(cell_to_string(row, i))),
+                sample_model: SampleModel::from(&cell_to_string(row, indices.sample_model)),
+                sample_id: cell_to_string(row, indices.sample_id),
+                test_status: TestStatus::from(&cell_to_string(row, indices.test_status)),
+                test_temperature: TestTemperature::from(&cell_to_string(
+                    row,
+                    indices.test_temperature,
+                )),
+                initial_capacity: parse_cell_f32(row, indices.initial_capacity),
+                current_capacity: parse_cell_f32(row, indices.current_capacity),
+                previous_cycles: parse_cell_usize(row, indices.previous_cycles),
+                current_cycles: parse_cell_usize(row, indices.current_cycles),
+                form_path: None,
+            })
+        })
+        .collect();
+
+    Ok(channel_list)
+}
+
+// 打印整个 Vec<ChannelInfo> 的表格形式
+fn print_channel_list_table(channel_list: &[ChannelInfo]) {
+    if channel_list.is_empty() {
+        println!("{}", "没有找到通道数据".yellow().bold());
+        return;
+    }
+
+    // 打印表格标题
+    println!("\n{}", "电池测试通道信息".bold().cyan().on_black());
+    println!("{}", "=".repeat(120).cyan());
+
+    // 表格头部
+    println!(
+        "{:<5} {:<6} {:<5} {:<8} {:<8} {:<6} {:<5} {:<5} {:<8} {:<10} {:<8}",
+        "序号".bold(),
+        "设备".bold(),
+        "通道".bold(),
+        "状态".bold(),
+        "申请单号".bold(),
+        "电芯型号".bold(),
+        "电芯编号".bold(),
+        "测试温度".bold(),
+        "当前容量".bold(),
+        "循环数".bold(),
+        "送样人".bold()
+    );
+    println!("{}", "─".repeat(120).dimmed());
+
+    // 表格内容
+    for (i, channel) in channel_list.iter().enumerate() {
+        let status_str = format!("{:?}", channel.test_status);
+        let status_display = match channel.test_status {
+            TestStatus::Long => status_str.green().bold(),
+            // TestStatus::Completed => status_str.blue(),
+            TestStatus::None => status_str.dimmed(),
+            // TestStatus::Error => status_str.red().bold(),
+            // _ => status_str.normal(),
+        };
+
+        let capacity_display = if let Some(cap) = channel.current_capacity {
+            format!("{:.2}", cap).green()
+        } else {
+            "N/A".dimmed()
+        };
+
+        let cycles_display = format!(
+            "{} / {}",
+            channel.previous_cycles.unwrap_or(0),
+            channel.current_cycles.unwrap_or(0)
+        );
+
+        let sample_person_display = channel
+            .sample_person
+            .as_ref()
+            .map(|s| s.as_str())
+            .unwrap_or("N/A")
+            .dimmed();
+
+        println!(
+            "{:<6} {:<8} {:<8} {:<8} {:<15} {:<8} {:<12} {:<8} {:<10} {:<15} {:<10}",
+            format!("{}", i + 1).bold(),
+            channel.device,
+            channel.channel.cyan(),
+            status_display,
+            channel.project_code,
+            format!("{:?}", channel.sample_model),
+            channel.sample_id.yellow(),
+            format!("{:?}", channel.test_temperature),
+            capacity_display,
+            cycles_display.magenta(),
+            sample_person_display
+        );
+    }
+
+    println!("{}", "=".repeat(120).cyan());
+    println!(
+        "{}: {}",
+        "总计通道数".bold(),
+        channel_list.len().to_string().green().bold()
+    );
+}
+
+#[derive(Debug)]
+pub struct ChannelInfo {
+    device: String,
+    channel: String,
+    channel_prv: Option<String>,
+    project_code: String,
+    sample_person: Option<String>,
+    sample_model: SampleModel,
+    sample_id: String,
+    test_status: TestStatus,
+    test_temperature: TestTemperature,
+    initial_capacity: Option<f32>,
+    current_capacity: Option<f32>,
+    previous_cycles: Option<usize>,
+    current_cycles: Option<usize>,
+    form_path: Option<PathBuf>,
+}
+
+impl ChannelInfo {
+    fn get_active(&self) -> Option<ChannelActive> {
+        if self.test_status.is_long() && !self.project_code.is_empty() {
+            let device = self.device.clone();
+            let channel = self.channel.clone();
+            let channel_prv = self.channel_prv.clone();
+            let first_run = if self.initial_capacity.is_none() {
+                true
+            } else {
+                false
+            };
+            let channel_active = ChannelActive {
+                device,
+                channel,
+                channel_prv,
+                first_run,
+            };
+            return Some(channel_active);
+        }
+        None
+    }
+    fn get_device(&self) -> String {
+        self.device.clone()
+    }
+    fn update_initial_capacity(&mut self, capacity: f32) {
+        if self.initial_capacity.is_none() {
+            self.initial_capacity = Some(capacity);
+        }
+    }
+    fn update_capacity(&mut self, new: f32) {
+        self.current_capacity = Some(new);
+    }
+    fn update_cycles(&mut self, new: usize) {
+        let prev = self.previous_cycles.unwrap_or(0);
+        let curt = self.current_cycles.unwrap_or(0);
+
+        // let cont = curt - prev;
+
+        if new > curt {
+            //新的圈数大于现有圈数
+            self.current_cycles = Some(new);
+            self.previous_cycles = Some(prev); //如果为空就自动变为0
+        } else {
+            let new_total = prev + new;
+            if new_total < curt {
+                // let project_code = self.project_code.clone();
+                // let sample_id = self.sample_id.clone();
+                //启动对话框，询问实际圈数
+                match self.show_cycle_dialog(curt, new_total) {
+                    DialogResult::Cancel => {
+                        println!("用户取消，放弃更新");
+                        return; // 放弃更新
+                    }
+                    DialogResult::Ignore => {
+                        println!("用户选择忽略，强行更新数据");
+                        self.current_cycles = Some(new_total);
+                    }
+                    DialogResult::Confirm(actual_cycles) => {
+                        println!("用户确认，实际圈数为: {}", actual_cycles);
+
+                        // 根据你的业务逻辑，这里可能需要调整
+                        // 如果是没加200圈的情况
+                        if new_total < curt {
+                            // 可以选择加200圈
+                            // self.current_cycles = Some(actual_cycles + 200);
+
+                            // 或者直接使用用户输入的值
+                            self.current_cycles = Some(actual_cycles);
+                        } else {
+                            self.current_cycles = Some(actual_cycles);
+                        }
+                    }
+                }
+                // self.current_cycles = Some(new_total + 200); //接续后小于现有，说明没加200圈
+            } else {
+                self.current_cycles = Some(new_total);
+            }
+            // if new > cont {
+            //     //但是新的圈数大于接续后的圈数
+            //     self.current_cycles = Some(prev + new); //获取参数，故使用new
+            // } else {
+            //     //新的圈数也小于接续后的圈数，说明开启新的200圈DCR了
+            //     self.previous_cycles = Some(prev + 200);
+            //     self.current_cycles = Some(prev + 200 + new);
+            // }
+        }
+    }
+    fn show_cycle_dialog(&self, current: usize, calculated: usize) -> DialogResult {
+        println!("\n=== 圈数更新确认 ===");
+        println!("项目: {}", self.project_code);
+        println!("样本ID: {}", self.sample_id);
+        println!("当前记录圈数: {}", current);
+        println!("计算得到的新圈数: {}", calculated);
+        println!("计算值小于当前值，请确认实际圈数。\n");
+
+        loop {
+            // 显示选项
+            let options = vec!["1. 取消更新", "2. 忽略并强行更新", "3. 输入实际圈数"];
+
+            let selection = Select::new()
+                .with_prompt("请选择操作:")
+                .items(&options)
+                .default(0)
+                .interact()
+                .unwrap_or(0);
+
+            match selection {
+                0 => {
+                    // 取消更新
+                    if Confirm::new()
+                        .with_prompt("确定要取消更新吗？")
+                        .default(false)
+                        .interact()
+                        .unwrap_or(false)
+                    {
+                        return DialogResult::Cancel;
+                    }
+                    // 如果不确定，继续循环
+                }
+                1 => {
+                    // 忽略并强行更新
+                    if Confirm::new()
+                        .with_prompt("确定要忽略并强行更新数据吗？")
+                        .default(false)
+                        .interact()
+                        .unwrap_or(false)
+                    {
+                        return DialogResult::Ignore;
+                    }
+                    // 如果不确定，继续循环
+                }
+                2 => {
+                    // 输入实际圈数
+                    match self.get_valid_cycle_input() {
+                        Ok(cycles) => return DialogResult::Confirm(cycles),
+                        Err(_) => {
+                            println!("输入无效，请重新选择操作");
+                            // 继续循环
+                        }
+                    }
+                }
+                _ => {
+                    println!("无效选择，请重试");
+                }
+            }
+        }
+    }
+
+    fn get_valid_cycle_input(&self) -> Result<usize, String> {
+        loop {
+            let input: String = Input::new()
+                .with_prompt("请输入实际圈数 (正整数，0-4294967295)")
+                .allow_empty(false)
+                .interact_text()
+                .map_err(|e| format!("输入错误: {}", e))?;
+
+            // 尝试解析为 u32
+            match u32::from_str(&input.trim()) {
+                Ok(value) => {
+                    // 检查是否为正数（根据业务需求，0可能有效也可能无效）
+                    if value == 0 {
+                        println!("警告: 圈数为0，请确认是否正确");
+                        if Confirm::new()
+                            .with_prompt("确认使用0作为圈数吗？")
+                            .default(false)
+                            .interact()
+                            .unwrap_or(false)
+                        {
+                            return Ok(0);
+                        } else {
+                            continue; // 重新输入
+                        }
+                    }
+                    return Ok(value as usize);
+                }
+                Err(e) => {
+                    println!("输入无效: {}，请重新输入", e);
+                    // 继续循环
+                }
+            }
+        }
+    }
+    fn update_form_path(&mut self, path: PathBuf) {
+        self.form_path = Some(path);
+    }
+}
+
+// 定义对话框结果枚举
+enum DialogResult {
+    Cancel,      // 取消，放弃更新
+    Ignore,      // 忽略，强行更新
+    Confirm(usize), // 确认，使用输入的圈数
+}
+
+#[derive(Debug)]
+pub enum TestStatus {
+    Long,
+    None,
+}
+
+#[derive(Debug)]
+pub enum TestTemperature {
+    T25,
+    T35,
+    T45,
+    T55,
+    None,
+}
+
+#[derive(Debug)]
+pub enum SampleModel {
+    H50,
+    H65,
+    H100,
+    H150,
+    H180,
+    H280,
+    S50,
+    Na165,
+    Na170,
+    None,
+}
+
+impl TestStatus {
+    pub fn from(text: &str) -> TestStatus {
+        match text {
+            "长期" => TestStatus::Long,
+            _ => TestStatus::None,
+        }
+    }
+    pub fn is_long(&self) -> bool {
+        if let TestStatus::Long = self {
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl TestTemperature {
+    pub fn from(text: &str) -> Self {
+        let pattern = r"(25℃|35℃|45℃|55℃)";
+        let re = Regex::new(pattern).unwrap();
+
+        if let Some(mat) = re.find(text) {
+            match mat.as_str() {
+                "25℃" => TestTemperature::T25,
+                "35℃" => TestTemperature::T35,
+                "45℃" => TestTemperature::T45,
+                "55℃" => TestTemperature::T55,
+                _ => TestTemperature::None,
+            }
+        } else {
+            TestTemperature::None
+        }
+    }
+}
+
+impl SampleModel {
+    pub fn from(text: &str) -> Self {
+        match text {
+            "铝壳50" => SampleModel::H50,
+            "65" => SampleModel::H65,
+            "100" => SampleModel::H100,
+            "150" => SampleModel::H150,
+            "180" => SampleModel::H180,
+            "280" => SampleModel::H280,
+            "软包50" => SampleModel::S50,
+            "钠电165" => SampleModel::Na165,
+            "钠电170" => SampleModel::Na170,
+            _ => SampleModel::None,
+        }
+    }
+}
+
+impl fmt::Display for TestTemperature {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TestTemperature::T25 => write!(f, "25℃"),
+            TestTemperature::T35 => write!(f, "35℃"),
+            TestTemperature::T45 => write!(f, "45℃"),
+            TestTemperature::T55 => write!(f, "55℃"),
+            TestTemperature::None => write!(f, "未设置"),
+        }
+    }
+}
+
+impl fmt::Display for SampleModel {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            SampleModel::H50 => write!(f, "铝壳50"),
+            SampleModel::H65 => write!(f, "铝壳65"),
+            SampleModel::H100 => write!(f, "铝壳100"),
+            SampleModel::H150 => write!(f, "铝壳150"),
+            SampleModel::H180 => write!(f, "铝壳180"),
+            SampleModel::H280 => write!(f, "铝壳280"),
+            SampleModel::S50 => write!(f, "软包50"),
+            SampleModel::Na165 => write!(f, "钠电165"),
+            SampleModel::Na170 => write!(f, "钠电170"),
+            SampleModel::None => write!(f, "未设置"),
+        }
+    }
+}
+
+impl fmt::Display for TestStatus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TestStatus::Long => write!(f, "长期"),
+            TestStatus::None => write!(f, "离线"),
+        }
+    }
+}
+
+// 为 ChannelInfo 实现 Display trait
+impl fmt::Display for ChannelInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "┌{0:─<50}┐\n", "")
+            .and_then(|_| write!(f, "│ {:<48} │\n", "通道信息".bold()))
+            .and_then(|_| write!(f, "├{0:─<50}┤\n", ""))
+            .and_then(|_| write!(f, "│ {:<16}: {:<30} │\n", "设备", self.device))
+            .and_then(|_| write!(f, "│ {:<16}: {:<30} │\n", "通道", self.channel))
+            .and_then(|_| {
+                if let Some(channel_prv) = &self.channel_prv {
+                    write!(f, "│ {:<16}: {:<30} │\n", "先前通道", channel_prv)
+                } else {
+                    write!(f, "│ {:<16}: {:<30} │\n", "先前通道", "未设置".dimmed())
+                }
+            })
+            .and_then(|_| {
+                write!(
+                    f,
+                    "│ {:<16}: {:<30} │\n",
+                    "申请单号",
+                    self.project_code.cyan()
+                )
+            })
+            .and_then(|_| {
+                if let Some(sample_person) = &self.sample_person {
+                    write!(f, "│ {:<16}: {:<30} │\n", "送样人", sample_person)
+                } else {
+                    write!(f, "│ {:<16}: {:<30} │\n", "送样人", "未设置".dimmed())
+                }
+            })
+            .and_then(|_| write!(f, "│ {:<16}: {:<30} │\n", "电芯型号", self.sample_model))
+            .and_then(|_| {
+                write!(
+                    f,
+                    "│ {:<16}: {:<30} │\n",
+                    "电芯编号",
+                    self.sample_id.yellow()
+                )
+            })
+            .and_then(|_| {
+                write!(
+                    f,
+                    "│ {:<16}: {:<30} │\n",
+                    "测试状态",
+                    format!("{:?}", self.test_status)
+                )
+            })
+            .and_then(|_| write!(f, "│ {:<16}: {:<30} │\n", "测试温度", self.test_temperature))
+            .and_then(|_| {
+                if let Some(ic) = self.initial_capacity {
+                    write!(f, "│ {:<16}: {:<9.2} Ah{:<21} │\n", "初始容量", ic, "")
+                } else {
+                    write!(f, "│ {:<16}: {:<30} │\n", "初始容量", "未设置".dimmed())
+                }
+            })
+            .and_then(|_| {
+                if let Some(cc) = self.current_capacity {
+                    write!(f, "│ {:<16}: {:<9.2} Ah{:<21} │\n", "当前容量", cc, "")
+                } else {
+                    write!(f, "│ {:<16}: {:<30} │\n", "当前容量", "未设置".dimmed())
+                }
+            })
+            .and_then(|_| {
+                let cycles = format!(
+                    "{} / {}",
+                    self.previous_cycles.unwrap_or(0),
+                    self.current_cycles.unwrap_or(0)
+                );
+                write!(f, "│ {:<16}: {:<30} │\n", "循环次数", cycles.magenta())
+            })
+            .and_then(|_| write!(f, "└{0:─<50}┘\n", ""))
     }
 }
